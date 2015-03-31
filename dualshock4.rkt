@@ -336,6 +336,23 @@
 ; IOHIDDeviceRegisterInputReportCallback(
 ;   inIOHIDDeviceRef, report, reportSize, Handle_IOHIDDeviceIOHIDReportCallback, inContext);
 
+; Docs
+;   Objective-C
+;     void IOHIDManagerScheduleWithRunLoop ( IOHIDManagerRef manager, 
+;                                            CFRunLoopRef runLoop, CFStringRef runLoopMode );
+; Schedule the HID manager normally to get callbacks during runtime.
+; IOHIDManagerScheduleWithRunLoop(HID_MANAGER, CFRunLoopGetMain(), kCFRunLoopDefaultMode);
+
+(define-cocoa NSDefaultRunLoopMode _NSString) ; "kCFRunLoopDefaultMode"
+
+(define CFRunLoopRef (_cpointer 'CFRunLoop))
+(define-cf CFRunLoopGetMain (_fun -> CFRunLoopRef))
+
+(define-iokit IOHIDManagerScheduleWithRunLoop
+  (_fun IOHIDManagerRef CFRunLoopRef CFStringRef -> _void))
+
+
+
 (define dualshock4-dev (find-dualshock4))
 (when dualshock4-dev
   (IOHIDDeviceRegisterInputReportCallback 
@@ -343,7 +360,12 @@
    report 
    report-size
    device-report-callback
-   #f))
+   #f)
+  (IOHIDManagerScheduleWithRunLoop tIOHIDManagerRef 
+                                   (CFRunLoopGetMain)
+                                   NSDefaultRunLoopMode))
+
+
 
 
    
