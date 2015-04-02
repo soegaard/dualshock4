@@ -3,6 +3,7 @@
 (require ffi/unsafe
          ffi/unsafe/objc
          ffi/unsafe/define)
+(require "IOHIDUsageTables-h.rkt")
 
 (define (>> n places) (arithmetic-shift n (- places)))
 
@@ -36,10 +37,7 @@
 ; 3. Import the framework using the ffi.
 
 (define iokit-lib (ffi-lib "/System/Library/Frameworks/IOKit.framework/IOKit"))
-
-(unless iokit-lib 
-  (error 'dualshock4.rkt "The IOKit framework didn't load"))
-
+(unless iokit-lib (error 'dualshock4.rkt "The IOKit framework didn't load"))
 (define-ffi-definer define-iokit iokit-lib)
 
 ; 4. Create an IOHIDManager object
@@ -87,7 +85,8 @@
 (define-iokit IOHIDManagerCreate
   (_fun CFAllocatorRef IOOptionBits -> IOHIDManagerRef))
 
-(define tIOHIDManagerRef (IOHIDManagerCreate kCFAllocatorDefault kIOHIDOptionsTypeNone))
+(define tIOHIDManagerRef (IOHIDManagerCreate kCFAllocatorDefault kIOHIDOptionsTypeSeizeDevice
+                                             #;kIOHIDOptionsTypeNone)) ; xxx
 
 ; 4. Find devices to manage.
 ; Docs
@@ -316,13 +315,31 @@
   (_fun _context IOReturn _sender IOHIDReportType _report-id _report CFIndex
         -> _void))
 
+(define IOHIDValueRef (_cpointer 'IOHIDValue))
+(define-iokit IOHIDValueGetIntegerValue 
+  (_fun IOHIDValueRef -> CFIndex))
+
+(define IOHIDValueCallback
+  (_fun _context IOReturn _sender IOHIDValueRef -> _void))
+
 (define report-size 64)
 (define report (cast (malloc _byte report-size 'eternal)
                      _pointer _report))
 
 (define foo 42)
+(define received #f)
+(define count 0)
+(define result #f)
 (define (device-report-callback context return sender report-type report-id report report-length)
-  (set! foo 'called))
+  ;; WARNING
+  ; This runs in the main Cocoa event loop.
+  ; This means display and friends are banned.
+  ; Store the values and use them elsewhere.
+  ; (set! received (list context return sender report-type report-id report report-length))
+  (set! count (+ count 1))
+  (when (= return 0)  ; success
+    (set! result return)
+    (set! foo 'called)))
                                 
 ; void IOHIDDeviceRegisterInputReportCallback ( 
 ;   IOHIDDeviceRef device, uint8_t *report, CFIndex reportLength, 
@@ -332,6 +349,11 @@
 
 (define-iokit IOHIDDeviceRegisterInputReportCallback
   (_fun IOHIDDeviceRef _report CFIndex IOHIDReportCallback _context -> _void))
+
+
+(define-iokit IOHIDDeviceRegisterInputValueCallback
+  (_fun IOHIDDeviceRef IOHIDValueCallback _context -> _void))
+
 
 ; IOHIDDeviceRegisterInputReportCallback(
 ;   inIOHIDDeviceRef, report, reportSize, Handle_IOHIDDeviceIOHIDReportCallback, inContext);
@@ -351,10 +373,9 @@
 (define-iokit IOHIDManagerScheduleWithRunLoop
   (_fun IOHIDManagerRef CFRunLoopRef CFStringRef -> _void))
 
-
-
 (define dualshock4-dev (find-dualshock4))
-(when dualshock4-dev
+
+#;(when dualshock4-dev
   (IOHIDDeviceRegisterInputReportCallback 
    dualshock4-dev ; device
    report 
@@ -365,10 +386,64 @@
                                    (CFRunLoopGetMain)
                                    NSDefaultRunLoopMode))
 
+(define IOHIDElementRef (_cpointer 'IOHIDElementRef))
+(define-iokit IOHIDElementGetUsagePage (_fun IOHIDElementRef -> _uint32))
+(define-iokit IOHIDElementGetUsage     (_fun IOHIDElementRef -> _uint32))
 
+; IOHIDElementRef IOHIDValueGetElement ( IOHIDValueRef value );
+(define-iokit IOHIDValueGetElement
+  (_fun IOHIDValueRef -> IOHIDElementRef))
 
+;(define IOHIDValueCallback (_fun _context IOReturn _sender IOHIDValueRef -> _void))
+(define called 0)
+(define val #f)
+(define val-ioreturn #f)
+(define usage #f)
+(define usage-page #f)
+(define state #f)
+(define button-A #f)
+(define button-B #f)
+(define button-X #f)
+(define button-Y #f)
+(define button-L1 #f)
+(define button-R1 #f)
+(define button #f)
+(define (dualshock4-input-value-callback context ioreturn sender value-ref)
+  (set! called (+ called 1))
+  (when (= ioreturn 0)  ; success
+    ; TODO At the moment, the call to IOHIDValueGetIntegerValue leads to a crash.
+    ;      
+    ; (set! state (IOHIDValueGetIntegerValue value-ref))
+    (define element  (IOHIDValueGetElement      value-ref))
+    ; (set! state      (IOHIDValueGetIntegerValue value-ref))
+    
+    ;(set! usage      (IOHIDElementGetUsage      element))
+    ;(set! usage-page (IOHIDElementGetUsagePage  element))
+    (cond
+      [(eqv? usage-page kHIDPage_Button)
+       (case usage
+         [(#x02) (set! button 'A)
+                 (set! button-A state)]
+         [(#x03) (set! button 'B)
+                 (set! button-B state)]
+         [(#x01) (set! button-X state)]
+         [(#x04) (set! button-Y state)]
+         [(#x05) (set! button-L1 state)]
+         [(#x06) (set! button-R1 state)]
+         ; 
+         [else (void)])]))
+  (void))
 
-   
+; (define-iokit IOHIDDeviceRegisterInputValueCallback 
+;    (_fun IOHIDDeviceRef IOHIDValueCallback _context -> _void))
+(when dualshock4-dev
+  (IOHIDDeviceRegisterInputValueCallback 
+   dualshock4-dev                   ; device
+   dualshock4-input-value-callback 
+   #f)
+  (IOHIDManagerScheduleWithRunLoop tIOHIDManagerRef 
+                                   (CFRunLoopGetMain)
+                                   NSDefaultRunLoopMode))
 
 
 ; PS3SixAxis *context = (PS3SixAxis*)inContext;
@@ -389,3 +464,4 @@
 ;    return ( IOHIDDeviceGetProperty( inIOHIDDeviceRef, CFSTR(kIOHIDManufacturerKey) ) );
 ;} 
 
+; https://github.com/andykorth/GGJ15/blob/03db742f699f20fd47609c31acd9d5602f3e27be/Source/CCController.m
