@@ -2,14 +2,15 @@
 (require (for-syntax syntax/parse racket/syntax racket/base))
 (require ffi/unsafe
          ffi/unsafe/objc
-         ffi/unsafe/define)
+         ffi/unsafe/define
+         ffi/unsafe/atomic)
 (require "IOHIDUsageTables-h.rkt")
 
 (define (>> n places) (arithmetic-shift n (- places)))
 
 ;;; 
 ;;; Dualshock 4 by Sony is the standard game controller used with the Playstation 4.
-;;; This packages makes it possible to use the Dualshock 4 game controller i Racket games on OS X.
+;;; This packages makes it possible to use the Dualshock 4 game controller in Racket games on OS X.
 ;;; Apple provides a GameController framework, unfortunately the Dualshock 4 controller
 ;;; is not supported. Therefore this package uses the IOKit framework and in particular the
 ;;; IOHID part of the framework. Here HID stands for Human Interface Device. It is a general
@@ -19,11 +20,10 @@
 ; https://developer.apple.com/library/mac/documentation/IOKit/Reference/IOHIDManager_header_reference/
 
 ; Docs
-;   OHIDManager defines an Human Interface Device (HID) managment object. 
+;   OHIDManager defines an Human Interface Device (HID) management object. 
 ;   It provides global interaction with managed HID devices such as discovery/removal 
 ;   and receiving input events. IOHIDManager is also a CFType object and as such 
-;   conforms to all the conventions expected such object.
-
+;   conforms to all the conventions expected of such an object.
 
 ; 2. Find the name of the framework
 ;    From the url, one sees the framework is called IOKit.
@@ -78,15 +78,16 @@
 ;(import-class IOHIDManager)
 ;(unless IOHIDManager (error 'imort-class "IOHIDManager wasn't imported"))
 
-; A reference to a IOHIDManger is called IOHIDManagerRef:
+; A reference to a IOHIDManager is called IOHIDManagerRef:
 (define IOHIDManagerRef (_cpointer 'IOHIDManagerRef))
 
 ; We are now ready to import IOHIDManagerCreate.
 (define-iokit IOHIDManagerCreate
   (_fun CFAllocatorRef IOOptionBits -> IOHIDManagerRef))
 
-(define tIOHIDManagerRef (IOHIDManagerCreate kCFAllocatorDefault kIOHIDOptionsTypeSeizeDevice
-                                             #;kIOHIDOptionsTypeNone)) ; xxx
+(define tIOHIDManagerRef (IOHIDManagerCreate kCFAllocatorDefault
+                           kIOHIDOptionsTypeSeizeDevice ; seize exclusive communication
+                           #;kIOHIDOptionsTypeNone)) ; xxx
 
 ; 4. Find devices to manage.
 ; Docs
@@ -135,7 +136,7 @@
 
 ; Notes: 
 ;   Swift: typealias CFSetRef = CFSet
-;   A CFSetRef is a reference to an immutable set obect
+;   A CFSetRef is a reference to an immutable set object
 (define CFSetRef (_cpointer 'CFSetRef))
 
 (define-iokit IOHIDManagerCopyDevices
@@ -275,7 +276,7 @@
     [#f #f]
     [p  (>> p 8)]))
 
-(define dualshock4-product-id #x5c4)
+(define dualshock4-product-id #x5c4) ; 1476
 
 (define (find-dualshock4)
   (for/or ([i device-count])
@@ -386,13 +387,41 @@
                                    (CFRunLoopGetMain)
                                    NSDefaultRunLoopMode))
 
+; A device has several elements (buttons, sticks etc)
 (define IOHIDElementRef (_cpointer 'IOHIDElementRef))
 (define-iokit IOHIDElementGetUsagePage (_fun IOHIDElementRef -> _uint32))
 (define-iokit IOHIDElementGetUsage     (_fun IOHIDElementRef -> _uint32))
+; Each element has a unique identifier, a cookie:
+
+;IOHIDElementCookie IOHIDElementGetCookie(IOHIDElementRef element);
+(define _IOHIDElementCookie _uint32)
+(define-iokit IOHIDElementGetCookie (_fun IOHIDElementRef -> _IOHIDElementCookie))
 
 ; IOHIDElementRef IOHIDValueGetElement ( IOHIDValueRef value );
 (define-iokit IOHIDValueGetElement
   (_fun IOHIDValueRef -> IOHIDElementRef))
+
+; CF_EXPORT  IOHIDElementType IOHIDElementGetType( IOHIDElementRef element)
+(define _IOHIDElementType _uint32)
+(define-iokit IOHIDElementGetType (_fun IOHIDElementRef -> _IOHIDElementType))
+
+; enum IOHIDElementType {
+;    kIOHIDElementTypeInput_Misc        = 1,
+;    kIOHIDElementTypeInput_Button      = 2,
+;    kIOHIDElementTypeInput_Axis        = 3,
+;    kIOHIDElementTypeInput_ScanCodes   = 4,
+;    kIOHIDElementTypeOutput            = 129,
+;    kIOHIDElementTypeFeature           = 257,
+;    kIOHIDElementTypeCollection        = 513
+; };
+(define kIOHIDElementTypeInput_Misc         1)
+(define kIOHIDElementTypeInput_Button       2)
+(define kIOHIDElementTypeInput_Axis         3)
+(define kIOHIDElementTypeInput_ScanCodes    4)
+(define kIOHIDElementTypeOutput           129)
+(define kIOHIDElementTypeFeature          257)
+(define kIOHIDElementTypeCollection       513)
+
 
 ;(define IOHIDValueCallback (_fun _context IOReturn _sender IOHIDValueRef -> _void))
 (define called 0)
@@ -407,31 +436,73 @@
 (define button-Y #f)
 (define button-L1 #f)
 (define button-R1 #f)
-(define button #f)
+(define button-L2 #f)
+(define button-R2 #f)
+(define button-shared #f)
+(define button-options #f)
+(define button-PS #f)
+(define button-left-stick #f)
+(define button-right-stick #f)
+(define button  #f)
+(define element #f)
+(define cookie  #f)
+(define element-type #f)
+
+(define changed '())
+
+(define N 255) ; 255 picked arbitrarily
+(define cache (make-vector N 0)) 
+(define (cache-set! id val)
+  (cond
+    [(<= 0 id N) (vector-set! cache id val)]
+    [else        (void)]))
+(define (cache-ref id)
+  (cond
+    [(<= 0 id N) (vector-ref cache id)]
+    [else        0]))
+
 (define (dualshock4-input-value-callback context ioreturn sender value-ref)
+  ; allocations will lead to crash
+  (start-atomic)
   (set! called (+ called 1))
   (when (= ioreturn 0)  ; success
     ; TODO At the moment, the call to IOHIDValueGetIntegerValue leads to a crash.
     ;      
     ; (set! state (IOHIDValueGetIntegerValue value-ref))
-    (define element  (IOHIDValueGetElement      value-ref))
-    ; (set! state      (IOHIDValueGetIntegerValue value-ref))
+    ; A device can have several elements (buttons, sticks etc)
+    (set! element      (IOHIDValueGetElement value-ref))
+    ; Each element of a device has a unique identifier, a cookie:
+    (set! cookie       (IOHIDElementGetCookie element))    
+    (set! state        (IOHIDValueGetIntegerValue value-ref)) ; should 
+    (set! element-type (IOHIDElementGetType element))
+    (set! usage        (IOHIDElementGetUsage      element))
+    (set! usage-page   (IOHIDElementGetUsagePage  element))
+    ;(define old (cache-ref cookie))
+    ;(unless old (cache-set! cookie state))
+    (define old (if   (<= 0 cookie N) (vector-ref cache cookie) 0))
+    (unless old (when (<= 0 cookie N) (vector-set! cache cookie state)))
+    (unless (= old state)
+      #;(when (or (= element-type kIOHIDElementTypeInput_Button)
+                (= element-type kIOHIDElementTypeInput_Axis)
+                ; (= element-type kIOHIDElementTypeInput_Misc) ; handles sticks 
+                )
+        (set! changed (cons (list cookie state usage-page usage element-type) changed)))
+      (cache-set! cookie state))
+    (when (= cookie  2)  (set! button-Y state))  ; square aka Y
+    (when (= cookie  3)  (set! button-B state))  ; cross aka B
+    (when (= cookie  5)  (set! button-X state))  ; triangle aka X
+    (when (= cookie  4)  (set! button-A state))  ; circle aka A
+    (when (= cookie  6)  (set! button-L1 state)) ; L1, L2, R1, R2 are on the back of the controller
+    (when (= cookie  7)  (set! button-R1 state))
+    (when (= cookie  8)  (set! button-L2 state))
+    (when (= cookie  9)  (set! button-R2 state))
+    (when (= cookie 10)  (set! button-shared state)) ;
     
-    ;(set! usage      (IOHIDElementGetUsage      element))
-    ;(set! usage-page (IOHIDElementGetUsagePage  element))
-    (cond
-      [(eqv? usage-page kHIDPage_Button)
-       (case usage
-         [(#x02) (set! button 'A)
-                 (set! button-A state)]
-         [(#x03) (set! button 'B)
-                 (set! button-B state)]
-         [(#x01) (set! button-X state)]
-         [(#x04) (set! button-Y state)]
-         [(#x05) (set! button-L1 state)]
-         [(#x06) (set! button-R1 state)]
-         ; 
-         [else (void)])]))
+    (when (= cookie 12)  (set! button-left-stick state))  ; you push the sticks to click  
+    (when (= cookie 13)  (set! button-right-stick state))
+    (when (= cookie 14)  (set! button-PS state))          ; A "PlayStation" button with the PS logo
+    (when (= cookie 15)  (set! button-options state)))    ; the touchpad also sends 15
+  (end-atomic)
   (void))
 
 ; (define-iokit IOHIDDeviceRegisterInputValueCallback 
